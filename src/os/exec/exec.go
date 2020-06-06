@@ -142,6 +142,7 @@ type Cmd struct {
 	goroutine       []func() error
 	errch           chan error // one send per goroutine
 	waitDone        chan struct{}
+	searchRoot		bool // flag for searching root (ie. `name` contains /, then we needn't search)
 }
 
 // Command returns the Cmd struct to execute the named program with
@@ -168,17 +169,38 @@ type Cmd struct {
 // leaving Args empty.
 func Command(name string, arg ...string) *Cmd {
 	cmd := &Cmd{
-		Path: name,
-		Args: append([]string{name}, arg...),
+		Path:       name,
+		Args:       append([]string{name}, arg...),
+		searchRoot: false,
 	}
 	if filepath.Base(name) == name {
 		if lp, err := LookPath(name); err != nil {
 			cmd.lookPathErr = err
 		} else {
 			cmd.Path = lp
+			cmd.searchRoot = true
 		}
 	}
 	return cmd
+}
+
+// We need to check whether `Chroot` has been set in syscall.SysProcAttr.
+// Since if the root of progress has changed, the error flag `lookPathErr`
+// become meaningless
+func (c *Cmd) checkRoot() (string, error) {
+	if !c.searchRoot {
+		return "", &Error{c.Path, ErrNotFound}
+	}
+	if c.SysProcAttr != nil && c.SysProcAttr.Chroot != "" {
+		fileName := filepath.Base(c.Path)
+		path := filepath.Join(c.SysProcAttr.Chroot, fileName)
+		if err := findExecutable(path); err != nil {
+			return "", err
+		} else {
+			return fileName, nil
+		}
+	}
+	return "", &Error{c.Path, ErrNotFound}
 }
 
 // CommandContext is like Command but includes a context.
@@ -201,8 +223,12 @@ func CommandContext(ctx context.Context, name string, arg ...string) *Cmd {
 // The output of String may vary across Go releases.
 func (c *Cmd) String() string {
 	if c.lookPathErr != nil {
-		// failed to resolve path; report the original requested path (plus args)
-		return strings.Join(c.Args, " ")
+		if lp, err := c.checkRoot(); err != nil {
+			// failed to resolve path; report the original requested path (plus args)
+			return strings.Join(c.Args, " ")
+		} else {
+			c.Path = lp
+		}
 	}
 	// report the exact executable path (plus args)
 	b := new(strings.Builder)
@@ -375,9 +401,13 @@ func lookExtensions(path, dir string) (string, error) {
 // once the command exits.
 func (c *Cmd) Start() error {
 	if c.lookPathErr != nil {
-		c.closeDescriptors(c.closeAfterStart)
-		c.closeDescriptors(c.closeAfterWait)
-		return c.lookPathErr
+		if lp, err := c.checkRoot(); err != nil {
+			c.closeDescriptors(c.closeAfterStart)
+			c.closeDescriptors(c.closeAfterWait)
+			return c.lookPathErr
+		} else {
+			c.Path = lp
+		}
 	}
 	if runtime.GOOS == "windows" {
 		lp, err := lookExtensions(c.Path, c.Dir)
